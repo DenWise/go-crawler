@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"unsafe"
 )
 
 const (
@@ -62,12 +63,23 @@ func (c *Crawler) Run() error {
 		}
 	}()
 
+	// ------------------------------
+	//var wg sync.WaitGroup
+	//for i := urls {
+	//	wg.Add(1)
+	//
+	//}
+
+
+
+	// ------------------------------
+
 	queue, sites, wait := makeQueue()
 
 	wait <- len(urls)
 
 	var wg sync.WaitGroup
-	for i := 0; i < defaultParallel; i++ {
+	for i := 0; i < len(urls); i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -218,7 +230,7 @@ func crawlSiteBody(s site, get func(string) (*http.Response, error)) (body strin
 	if err != nil {
 		return "", fmt.Errorf("error while read body: %v\n", err)
 	}
-	bodyString := string(bodyBytes)
+	bodyString := *(*string)(unsafe.Pointer(&bodyBytes))
 
 	return bodyString, nil
 }

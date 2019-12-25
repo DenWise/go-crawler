@@ -12,7 +12,7 @@ func BenchmarkCrawl(b *testing.B) {
 		crawler := Crawler{
 			Sites:  []string{
 				"https://www.scalyr.com/",
-				"https://techbeacon.com/",
+				//"https://techbeacon.com/",
 			},
 			Get:    nil,
 			Output: ioutil.Discard,
