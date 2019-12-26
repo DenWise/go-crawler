@@ -18,8 +18,8 @@ func main() {
 	crawler := crawler2.Crawler{
 		Sites:  []string{
 			"https://www.scalyr.com/",
+			"https://techbeacon.com/",
 		},
-		Get:    nil,
 		Output: output,
 		Logger: log.New(errWriter, "", 0),
 	}

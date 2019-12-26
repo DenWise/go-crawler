@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -34,11 +35,12 @@ type Crawler struct {
 type siteCrawler struct {
 	sem     chan int
 	queue   chan<- site
-	pages   <-chan site
+	pages   chan site
 	wait    chan<- int
 	results chan string
 	url     *url.URL
 	get     func(string) (*http.Response, error)
+	logger  *log.Logger
 }
 
 type site struct {
@@ -70,18 +72,10 @@ func (c *Crawler) Run() error {
 
 	// ------------------------------
 	var wg sync.WaitGroup
+
 	for i := range urls {
 		wg.Add(1)
-		queue, sites, wait := makeQueue()
-		siteCrawler{
-			sem:     make(chan int, 10),
-			queue:   queue,
-			pages:   sites,
-			wait:    wait,
-			results: results,
-			url:     urls[i],
-			get:     http.Get,
-		}.Start(&wg)
+		newSiteCrawler(urls[i], results).Start(&wg)
 	}
 
 	wg.Wait()
@@ -92,49 +86,53 @@ func (c *Crawler) Run() error {
 
 func (sc *siteCrawler) Start(wg *sync.WaitGroup) {
 
+	defer wg.Done()
 	sc.wait <- 1
 
 	wg.Add(1)
-	go func() { // запускаем горутину в которой запускается воркер, воркер обрабатывает сайты из канала queue, и сам же туда добавляет новые сайты
+	go func() {
 		defer wg.Done()
-		sc.worker(sc.pages, sc.queue, sc.wait, sc.results)
+
+		siteBody, err := crawlSiteBody(sc.url, sc.get)
+
+		if err != nil {
+			sc.wait <- -1
+			return
+		}
+
+		urls, err := sc.handleSiteBody(siteBody)
+		if err != nil {
+			sc.logger.Printf("page %v: %v\n", sc.url, err)
+		}
+
+		sc.wait <- len(urls) - 1
+
+		go queueURLs(sc.queue, urls, sc.url)
 	}()
 
-	sc.queue <- site{
-		URL:    sc.url,
-		Parent: nil,
-	}
+	wg.Add(1)
 
-	wg.Wait()
-}
+	// горутина которая читает из канала pages и запускает на каждую страницу воркер но не больше 10 воркеров на текущий домен
+	go func() {
+		defer wg.Done()
+		for p := range sc.pages {
+			siteBody, err := crawlSiteBody(p.URL, sc.get)
 
-func (sc *siteCrawler) worker(sites <-chan site, queue chan<- site, wait chan<- int, results chan<- string) {
+			if err != nil {
+				sc.wait <- -1
+				return
+			}
 
-	siteBody, err := crawlSiteBody(s, sc.get)
+			urls, err := sc.handleSiteBody(siteBody)
+			if err != nil {
+				sc.logger.Printf("page %v: %v\n", sc.url, err)
+			}
 
-	if err != nil {
-		c.Logger.Printf("%v : %s\n", err, s.URL.String())
-		wait <- -1
-		continue
-	}
+			sc.wait <- len(urls) - 1
 
-	title, externals, internals := getData(s.URL, siteBody)
-
-	results <- fmt.Sprintf("%v : %v -> title: %s, internals: %v, externals: %v",
-		s.Parent,
-		s.URL.String(),
-		title,
-		len(internals),
-		len(externals))
-
-	urls, err := validateSites(internals, url.Parse)
-	if err != nil {
-		c.Logger.Printf("page %v: %v\n", s.URL, err)
-	}
-
-	wait <- len(urls) - 1
-
-	go queueURLs(queue, urls, s.URL)
+			go queueURLs(sc.queue, urls, p.URL)
+		}
+	}()
 }
 
 func (c Crawler) validateCrawler() error {
@@ -148,6 +146,24 @@ func (c Crawler) validateCrawler() error {
 		return errors.New("logger not defined")
 	}
 	return nil
+}
+
+func (sc * siteCrawler) handleSiteBody(body string) (urls []*url.URL, err error) {
+
+	title, externals, internals := getData(sc.url, body)
+
+	sc.results <- fmt.Sprintf(" %v -> title: %s, internals: %v, externals: %v\n",
+		sc.url.String(),
+		title,
+		len(internals),
+		len(externals))
+
+	urls, err = validateSites(internals, url.Parse)
+	if err != nil {
+		return nil, err
+	}
+
+	return urls, nil
 }
 
 func validateSites(sites []string, parse func(string) (*url.URL, error)) (urls []*url.URL, err error) {
@@ -173,10 +189,24 @@ func validateSites(sites []string, parse func(string) (*url.URL, error)) (urls [
 	return
 }
 
-func makeQueue() (chan<- site, <-chan site, chan<- int) {
+func newSiteCrawler(site *url.URL, res chan string) *siteCrawler {
+	queue, pages, wait := makeQueue()
+	return &siteCrawler{
+		sem:     make(chan int, 10),
+		queue:   queue,
+		pages:   pages,
+		wait:    wait,
+		results: res,
+		url:     site,
+		get:     http.Get,
+		logger:  log.New(os.Stderr, "", 0),
+	}
+}
+
+func makeQueue() (chan<- site, chan site, chan<- int) {
 	queueCount := 0
 	wait := make(chan int)
-	sites := make(chan site)
+	pages := make(chan site)
 	queue := make(chan site)
 	visited := map[string]struct{}{}
 
@@ -190,20 +220,20 @@ func makeQueue() (chan<- site, <-chan site, chan<- int) {
 	}()
 
 	go func() {
-		for s := range queue {
-			u := s.URL.String()
+		for p := range queue {
+			u := p.URL.String()
 			if _, exists := visited[u]; !exists {
 				visited[u] = struct{}{}
-				sites <- s
+				pages <- p
 			} else {
 				wait <- -1
 			}
 		}
-		close(sites)
+		close(pages)
 		close(wait)
 	}()
 
-	return queue, sites, wait
+	return queue, pages, wait
 }
 
 func queueURLs(queue chan<- site, urls []*url.URL, parent *url.URL) {
@@ -215,9 +245,7 @@ func queueURLs(queue chan<- site, urls []*url.URL, parent *url.URL) {
 	}
 }
 
-func crawlSiteBody(s site, get func(string) (*http.Response, error)) (body string, err error) {
-	u := s.URL
-
+func crawlSiteBody(u *url.URL, get func(string) (*http.Response, error)) (body string, err error) {
 	r, err := get(u.String())
 	if err != nil {
 		return "", fmt.Errorf("failed to get %v: %v\n", u, err)
@@ -230,7 +258,7 @@ func crawlSiteBody(s site, get func(string) (*http.Response, error)) (body strin
 
 	// Stop when redirecting to external page
 	if r.Request.URL.Host != u.Host && wwwPrefix+r.Request.URL.Host != u.Host {
-		return "", fmt.Errorf("stoped cause it's redirecting to external resource: %v -> %v\n", s.Parent, r.Request.URL.Host)
+		return "", fmt.Errorf("stoped cause it's redirecting to external resource: -> %v\n", r.Request.URL.Host)
 	}
 
 	bodyBytes, err := ioutil.ReadAll(r.Body)
