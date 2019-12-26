@@ -15,7 +15,6 @@ import (
 )
 
 const (
-	defaultParallel       = 10
 	wwwPrefix             = "www."
 	protocolHostSeparator = "://"
 )
@@ -23,13 +22,23 @@ const (
 var (
 	reLinks = regexp.MustCompile(`<a.*?href="([^"]*)".*?>`)
 	reTitle = regexp.MustCompile(`<title.*?>(.*)</title>`)
+	sem     = make(chan int, 10)
 )
 
 type Crawler struct {
 	Sites  []string
-	Get    func(string) (*http.Response, error)
 	Output io.Writer
 	Logger *log.Logger
+}
+
+type siteCrawler struct {
+	sem     chan int
+	queue   chan<- site
+	pages   <-chan site
+	wait    chan<- int
+	results chan string
+	url     *url.URL
+	get     func(string) (*http.Response, error)
 }
 
 type site struct {
@@ -41,10 +50,6 @@ func (c *Crawler) Run() error {
 
 	if err := c.validateCrawler(); err != nil {
 		return err
-	}
-
-	if c.Get == nil {
-		c.Get = http.Get
 	}
 
 	urls, err := validateSites(c.Sites, url.Parse)
@@ -64,70 +69,72 @@ func (c *Crawler) Run() error {
 	}()
 
 	// ------------------------------
-	//var wg sync.WaitGroup
-	//for i := urls {
-	//	wg.Add(1)
-	//
-	//}
-
-
-
-	// ------------------------------
-
-	queue, sites, wait := makeQueue()
-
-	wait <- len(urls)
-
 	var wg sync.WaitGroup
-	for i := 0; i < len(urls); i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			c.worker(sites, queue, wait, results)
-		}()
-	}
-
 	for i := range urls {
-		queue <- site{
-			URL:    urls[i],
-			Parent: nil,
-		}
+		wg.Add(1)
+		queue, sites, wait := makeQueue()
+		siteCrawler{
+			sem:     make(chan int, 10),
+			queue:   queue,
+			pages:   sites,
+			wait:    wait,
+			results: results,
+			url:     urls[i],
+			get:     http.Get,
+		}.Start(&wg)
 	}
 
 	wg.Wait()
+	// ------------------------------
 
 	return nil
 }
 
-func (c *Crawler) worker(sites <-chan site, queue chan<- site, wait chan<- int, results chan<- string) {
-	for s := range sites {
+func (sc *siteCrawler) Start(wg *sync.WaitGroup) {
 
-		siteBody, err := crawlSiteBody(s, c.Get)
+	sc.wait <- 1
 
-		if err != nil {
-			c.Logger.Printf("%v : %s\n", err, s.URL.String())
-			wait <- -1
-			continue
-		}
+	wg.Add(1)
+	go func() { // запускаем горутину в которой запускается воркер, воркер обрабатывает сайты из канала queue, и сам же туда добавляет новые сайты
+		defer wg.Done()
+		sc.worker(sc.pages, sc.queue, sc.wait, sc.results)
+	}()
 
-		title, externals, internals := getData(s.URL, siteBody)
-
-		results <- fmt.Sprintf("%v : %v -> title: %s, internals: %v, externals: %v",
-			s.Parent,
-			s.URL.String(),
-			title,
-			len(internals),
-			len(externals))
-
-		urls, err := validateSites(internals, url.Parse)
-		if err != nil {
-			c.Logger.Printf("page %v: %v\n", s.URL, err)
-		}
-
-		wait <- len(urls) - 1
-
-		go queueURLs(queue, urls, s.URL)
+	sc.queue <- site{
+		URL:    sc.url,
+		Parent: nil,
 	}
+
+	wg.Wait()
+}
+
+func (sc *siteCrawler) worker(sites <-chan site, queue chan<- site, wait chan<- int, results chan<- string) {
+
+	siteBody, err := crawlSiteBody(s, sc.get)
+
+	if err != nil {
+		c.Logger.Printf("%v : %s\n", err, s.URL.String())
+		wait <- -1
+		continue
+	}
+
+	title, externals, internals := getData(s.URL, siteBody)
+
+	results <- fmt.Sprintf("%v : %v -> title: %s, internals: %v, externals: %v",
+		s.Parent,
+		s.URL.String(),
+		title,
+		len(internals),
+		len(externals))
+
+	urls, err := validateSites(internals, url.Parse)
+	if err != nil {
+		c.Logger.Printf("page %v: %v\n", s.URL, err)
+	}
+
+	wait <- len(urls) - 1
+
+	go queueURLs(queue, urls, s.URL)
 }
 
 func (c Crawler) validateCrawler() error {
