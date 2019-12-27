@@ -1,4 +1,4 @@
-package crawler
+package main
 
 import (
 	"errors"
@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 	"unsafe"
 )
 
@@ -23,7 +24,6 @@ const (
 var (
 	reLinks = regexp.MustCompile(`<a.*?href="([^"]*)".*?>`)
 	reTitle = regexp.MustCompile(`<title.*?>(.*)</title>`)
-	sem     = make(chan int, 10)
 )
 
 type Crawler struct {
@@ -50,6 +50,8 @@ type site struct {
 
 func (c *Crawler) Run() error {
 
+	startTime := time.Now()
+
 	if err := c.validateCrawler(); err != nil {
 		return err
 	}
@@ -64,23 +66,36 @@ func (c *Crawler) Run() error {
 
 	go func() {
 		for r := range results {
+			c.Logger.Print(r)
 			if _, err := fmt.Fprintln(c.Output, r); err != nil {
 				c.Logger.Printf("error while writing output '%s': %v\n", r, err)
 			}
 		}
 	}()
 
-	// ------------------------------
 	var wg sync.WaitGroup
 
 	for i := range urls {
 		wg.Add(1)
-		newSiteCrawler(urls[i], results).Start(&wg)
+		go newSiteCrawler(urls[i], results).Start(&wg)
 	}
 
 	wg.Wait()
-	// ------------------------------
 
+	c.Logger.Printf("Time has passed: %v", time.Since(startTime))
+	return nil
+}
+
+func (c Crawler) validateCrawler() error {
+	if len(c.Sites) == 0 {
+		return errors.New("no sites given")
+	}
+	if c.Output == nil {
+		return errors.New("output writer not defined")
+	}
+	if c.Logger == nil {
+		return errors.New("logger not defined")
+	}
 	return nil
 }
 
@@ -96,6 +111,7 @@ func (sc *siteCrawler) Start(wg *sync.WaitGroup) {
 		siteBody, err := crawlSiteBody(sc.url, sc.get)
 
 		if err != nil {
+			sc.logger.Printf("page %v: %v\n", sc.url, err)
 			sc.wait <- -1
 			return
 		}
@@ -116,36 +132,28 @@ func (sc *siteCrawler) Start(wg *sync.WaitGroup) {
 	go func() {
 		defer wg.Done()
 		for p := range sc.pages {
-			siteBody, err := crawlSiteBody(p.URL, sc.get)
+			sc.sem <- 1
+			go func() {
+				siteBody, err := crawlSiteBody(p.URL, sc.get)
 
-			if err != nil {
-				sc.wait <- -1
-				return
-			}
+				if err != nil {
+					sc.wait <- -1
+					<-sc.sem
+					return
+				}
 
-			urls, err := sc.handleSiteBody(siteBody)
-			if err != nil {
-				sc.logger.Printf("page %v: %v\n", sc.url, err)
-			}
+				urls, err := sc.handleSiteBody(siteBody)
+				if err != nil {
+					sc.logger.Printf("page %v: %v\n", sc.url, err)
+				}
 
-			sc.wait <- len(urls) - 1
+				sc.wait <- len(urls) - 1
 
-			go queueURLs(sc.queue, urls, p.URL)
+				go queueURLs(sc.queue, urls, p.URL)
+				<-sc.sem
+			}()
 		}
 	}()
-}
-
-func (c Crawler) validateCrawler() error {
-	if len(c.Sites) == 0 {
-		return errors.New("no sites given")
-	}
-	if c.Output == nil {
-		return errors.New("output writer not defined")
-	}
-	if c.Logger == nil {
-		return errors.New("logger not defined")
-	}
-	return nil
 }
 
 func (sc * siteCrawler) handleSiteBody(body string) (urls []*url.URL, err error) {
@@ -192,7 +200,7 @@ func validateSites(sites []string, parse func(string) (*url.URL, error)) (urls [
 func newSiteCrawler(site *url.URL, res chan string) *siteCrawler {
 	queue, pages, wait := makeQueue()
 	return &siteCrawler{
-		sem:     make(chan int, 10),
+		sem:     make(chan int, 5),
 		queue:   queue,
 		pages:   pages,
 		wait:    wait,
